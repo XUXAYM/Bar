@@ -2,13 +2,16 @@
 using OpenQA.Selenium.Chrome;
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
-using System.Linq.Expressions;
+using System.Net;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
-using System.Xml.Serialization;
 
 namespace СocktailParser
 {
@@ -53,13 +56,13 @@ namespace СocktailParser
         {
             ChromeDriver driver = new ChromeDriver();
             List<CocktailsData> cocktails = new List<CocktailsData>();
-            List<IWebElement> coctailsPreview;
             int count = 0;
             driver.Navigate().GoToUrl("https://ru.inshaker.com/cocktails");
             driver.Manage().Window.Maximize();
             Thread.Sleep(500);
             List<string> filter = ImportAlreadySavedCocktails();
-            filter = filter.Distinct().ToList();
+            if (filter.Count != 0)
+                filter = filter.Distinct().ToList();
             while (true)
             {
                 count++;
@@ -67,14 +70,26 @@ namespace СocktailParser
                 if (filter != null)
                     if (!filter.Contains(c.FindElement(By.ClassName("cocktail-item-name")).Text))
                     {
-                    Thread.Sleep(500);
-                    c.Click();
-                    Thread.Sleep(200);
-                    CocktailsData cocktail = ParseCoctailInfo(driver);
-                    cocktails.Add(cocktail);
-                    driver.Navigate().Back();
-                    driver.Navigate().Refresh();
-                    Thread.Sleep(100);
+                        Thread.Sleep(500);
+                        c.Click();
+                        Thread.Sleep(200);
+                        CocktailsData cocktail;
+                        while (true)
+                        {
+                            try
+                            {
+                                cocktail = ParseCoctailInfo(driver);
+                                break;
+                            }
+                            catch
+                            {
+                                continue;
+                            }
+                        }
+                        cocktails.Add(cocktail);
+                        driver.Navigate().Back();
+                        driver.Navigate().Refresh();
+                        Thread.Sleep(100);
                     }
                 if(count % 20 == 0)
                 {
@@ -87,7 +102,6 @@ namespace СocktailParser
         }
         static CocktailsData ParseCoctailInfo(ChromeDriver driver)
         {
-            Thread.Sleep(1200);
             var element = driver.FindElement(By.CssSelector(".common-title"));
             var cocktail = new CocktailsData();
             cocktail.Name = element.FindElement(By.CssSelector(".common-name")).Text;
@@ -104,9 +118,7 @@ namespace СocktailParser
             var toolsNames = toolsTable.FindElements(By.XPath(".//a"));
             cocktail.Tools.AddRange(toolsNames.Select(n => n.Text));
             var recipe = driver.FindElementsByXPath(".//*[@class=\"steps\"]//li");
-            //recipe.Select(r => r.Text)
             cocktail.Recipe = recipe.Select(r => r.Text).Aggregate((partialPhrase, word) => $"{partialPhrase}\n {word}");
-            Thread.Sleep(200);
             try
             {
                 cocktail.Description = driver.FindElement(By.XPath("//*[@class=\"body\"]//p")).Text;
@@ -122,39 +134,74 @@ namespace СocktailParser
                     cocktail.Description = "";
                 }
             }
+            var imageURL = driver.FindElementByCssSelector(".image").GetAttribute("src");
+            var web = new WebClient();
+            var imagePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"Images\\{Regex.Replace(Regex.Replace(cocktail.Name, "\"", ""), @"\?", "")}.jpg");
+            web.DownloadFile(imageURL, imagePath);
+            web.Dispose();
             return cocktail;
         }
         static List<string> ImportAlreadySavedCocktails()
         {
-            if (!File.Exists(fromFile)) return null;
+            if (!File.Exists(fromFile)) return new List<string>();
             List<string> names;
             DataContractJsonSerializer jsonFormatter = new DataContractJsonSerializer(typeof(CocktailsData[]));
             using (StreamReader stream = new StreamReader(fromFile, System.Text.Encoding.Default))
             {
-                CocktailsData[] p = (CocktailsData[])jsonFormatter.ReadObject(stream.BaseStream);
+                CocktailsData[] p = jsonFormatter.ReadObject(stream.BaseStream) as CocktailsData[];
                 names = p.Select(c => c.Name).ToList();
             }
             return names;
         }
         static void SaveCocktailsToFile(List<CocktailsData> cocktails)
         {
+            if (cocktails.Count == 0) return;
             DataContractJsonSerializer jsonFormatter = new DataContractJsonSerializer(typeof(CocktailsData[]));
             List<CocktailsData> toWrite = new List<CocktailsData>();
             if (File.Exists(fromFile))
                 using (StreamReader stream = new StreamReader(fromFile, System.Text.Encoding.Default))
                 {
-                    toWrite = ((CocktailsData[])jsonFormatter.ReadObject(stream.BaseStream)).ToList();
+                    toWrite = (jsonFormatter.ReadObject(stream.BaseStream) as CocktailsData[]).ToList();
                 }
             else
-                File.Create(fromFile);
+                File.Create(fromFile).Close();
             toWrite = toWrite.Union(cocktails).ToList();
             using (FileStream stream = new FileStream(toFile, FileMode.Create))
             {
                 jsonFormatter.WriteObject(stream, toWrite.ToArray());
             }
-            File.Delete(fromFile);
+            if (File.Exists(fromFile))
+                File.Delete(fromFile);
             File.Copy(toFile, fromFile);
         }
+        static Image ResizeImage(Image image, int width, int height)
+        {
+            var destRect = new Rectangle(0, 0, width, height);
+            var destImage = new Bitmap(width, height);
 
+            destImage.SetResolution(image.HorizontalResolution, image.VerticalResolution);
+
+            using (var graphics = Graphics.FromImage(destImage))
+            {
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.CompositingQuality = CompositingQuality.HighQuality;
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.SmoothingMode = SmoothingMode.HighQuality;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+                using (var wrapMode = new ImageAttributes())
+                {
+                    wrapMode.SetWrapMode(WrapMode.TileFlipXY);
+                    graphics.DrawImage(image, destRect, 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, wrapMode);
+                }
+            }
+
+            return (Image)destImage;
+        }
+        static (int height, int width) CalculateNewSize(Image image)
+        {
+            int scope = image.Height / 100;
+            return (100, image.Width / scope);
+        }
     }
 }
